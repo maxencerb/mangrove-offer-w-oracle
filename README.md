@@ -4,6 +4,12 @@ The goal here is to create a Direct offer for [Mangrove exchange](https://www.ma
 
 e.g. If we create an order to sell an asset `base_asset` at 1000 USDC at some point, the offer could be taken much later. In this case, the price of the `base_asset` could have changed and the taker would pay the `base_asset` with a discount. If the asset is valued at 1200 USDC, then it would be a 20% loss for the maker.
 
+## TODO
+
+- [x] Create a Direct offer with a price oracle
+- [ ] Review the code
+- [ ] Create tests
+
 ## Choices
 
 ### The market
