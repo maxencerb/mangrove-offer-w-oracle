@@ -13,18 +13,17 @@ abstract contract DirectOracle is Direct {
     uint128 maxSlippage;
     // if true, doesn't allow for any slippage (even prositive)
     bool strict;
-    // keep order if failed
-    bool keepOrder;
-    // deprovision if don't keep order
-    bool deprovision;
   }
 
+  // 100%
   uint public constant SLIPPAGE_PRECISION = 1e6;
-  uint public constant MAX_SLIPPAGE = SLIPPAGE_PRECISION * 100;
 
   uint public constant PRICE_PRECISION = 1e8;
 
   mapping(address => AggregatorV3Interface) internal _priceFeed;
+
+  // outbound token => inbound token => offerId => Slippage
+  mapping(address => mapping(address => mapping(uint => Slippage))) public offerMaxSlippage;
 
   event PriceFeedUpdated(address token, address priceFeed);
   event RetractedSlippageIncompatibleOffer(address indexed outbound_tkn, address indexed inbound_tkn, uint indexed offerId);
@@ -34,17 +33,9 @@ abstract contract DirectOracle is Direct {
   Direct(mgv, router_, gasreq, owner) {}
 
   modifier checkSlippage(Slippage memory slippage) {
-    require(slippage.maxSlippage <= MAX_SLIPPAGE, "DirectOracle/max-slippage-too-high");
+    require(slippage.maxSlippage <= SLIPPAGE_PRECISION, "DirectOracle/max-slippage-too-high");
     _;
   }
-
-  function getOfferMaxSlippageStorage(address outbound, address inbound, uint offerId) internal pure returns (Slippage storage slippage) {
-    bytes32 position = keccak256(abi.encodePacked(outbound, inbound, offerId));
-    assembly {
-      slippage.slot := position
-    }
-  }
-
 
   /// Update the price feed of a token
   /// @param token Token to get the price of
@@ -75,7 +66,7 @@ abstract contract DirectOracle is Direct {
 
   function _priceOf(uint asset1, uint asset2, uint dec1, uint dec2) internal pure returns (uint price) {
     if (dec1 > dec2) {
-      price = asset1 * PRICE_PRECISION / asset2 * (10 ** (dec1 - dec2));
+      price = asset1 * PRICE_PRECISION / (asset2 * 10 ** (dec1 - dec2));
     } else {
       price = asset1 * PRICE_PRECISION * (10 ** (dec2 - dec1)) / asset2;
     }
@@ -92,13 +83,13 @@ abstract contract DirectOracle is Direct {
     dec2 = IERC20(inbound).decimals();
 
     // Compute the price given the offer
-    uint offerPrice = _priceOf(gives, wants, dec1, dec2);
+    uint offerPrice = _priceOf(wants, gives, dec2, dec1);
 
     // compare
     upper = offerPrice >= price;
 
     if (upper) {
-      slippage = (offerPrice - price) * SLIPPAGE_PRECISION / price;
+      slippage = (offerPrice - price) * SLIPPAGE_PRECISION / offerPrice;
     } else {
       slippage = (price - offerPrice) * SLIPPAGE_PRECISION / price;
     }
@@ -112,10 +103,9 @@ abstract contract DirectOracle is Direct {
     require(address(_priceFeed[address(args.outbound_tkn)]) != address(0), "DirectOracle/price-feed-not-found");
     require(address(_priceFeed[address(args.inbound_tkn)]) != address(0), "DirectOracle/price-feed-not-found");
     (offerId, status) = _newOffer(args);
-    Slippage storage maxSlippage = getOfferMaxSlippageStorage(address(args.outbound_tkn), address(args.inbound_tkn), offerId);
-    maxSlippage.maxSlippage = slippage.maxSlippage;
-    maxSlippage.strict = slippage.strict;
-    maxSlippage.keepOrder = slippage.keepOrder;
+
+    offerMaxSlippage[address(args.outbound_tkn)][address(args.inbound_tkn)][offerId] = slippage;
+
     emit UpdatedOfferMaxSlippage(address(args.outbound_tkn), address(args.inbound_tkn), offerId, slippage);
   }
 
@@ -125,41 +115,45 @@ abstract contract DirectOracle is Direct {
     returns (bytes32 status) 
   {
     status = _updateOffer(args, offerId);
-    Slippage storage maxSlippage = getOfferMaxSlippageStorage(address(args.outbound_tkn), address(args.inbound_tkn), offerId);
-    maxSlippage.maxSlippage = slippage.maxSlippage;
-    maxSlippage.strict = slippage.strict;
-    maxSlippage.keepOrder = slippage.keepOrder;
+    offerMaxSlippage[address(args.outbound_tkn)][address(args.inbound_tkn)][offerId] = slippage;
     emit UpdatedOfferMaxSlippage(address(args.outbound_tkn), address(args.inbound_tkn), offerId, slippage);
   }
 
+  function retractOffer(
+    IERC20 outbound_tkn,
+    IERC20 inbound_tkn,
+    uint offerId,
+    bool deprovision
+  ) 
+    public
+    virtual
+    adminOrCaller(address(MGV)) 
+    returns (uint freeWei) 
+  {
+    delete offerMaxSlippage[address(outbound_tkn)][address(inbound_tkn)][offerId];
+    freeWei = super._retractOffer(outbound_tkn, inbound_tkn, offerId, deprovision);
+  } 
+
   function _isSlippageAcceptable(uint gives, uint wants, address outbound, address inbound, uint offerId) internal view returns (bool) {
     (uint slippage, bool upper) = _slippage(gives, wants, outbound, inbound);
-    Slippage storage maxSlippage = getOfferMaxSlippageStorage(outbound, inbound, offerId);
+    Slippage memory maxSlippage = offerMaxSlippage[outbound][inbound][offerId];
     return slippage <= maxSlippage.maxSlippage || (!maxSlippage.strict && upper);
   }
 
   /// @inheritdoc MangroveOffer
   function __lastLook__(MgvLib.SingleOrder calldata order) internal virtual override returns (bytes32 data) {
-    require(_isSlippageAcceptable(order.gives, order.wants, order.outbound_tkn, order.inbound_tkn, order.offerId), "DirectOracle/slippage-too-high");
+    require(_isSlippageAcceptable(order.wants, order.gives, order.outbound_tkn, order.inbound_tkn, order.offerId), "DirectOracle/slippage-too-high");
     data = super.__lastLook__(order);
   }
 
-  /// @inheritdoc MangroveOffer
-  function __posthookFallback__(MgvLib.SingleOrder calldata order, MgvLib.OrderResult calldata result)
-    internal
-    virtual
-    override
-    returns (bytes32 data)
-  {
-    Slippage storage maxSlippage = getOfferMaxSlippageStorage(order.outbound_tkn, order.inbound_tkn, order.offerId);
-    if (
-      !maxSlippage.keepOrder &&
-      !_isSlippageAcceptable(order.gives, order.wants, order.outbound_tkn, order.inbound_tkn, order.offerId)
-    ) {
-      // retract offer if slippage is still too high
-      _retractOffer(IERC20(order.outbound_tkn), IERC20(order.inbound_tkn), order.offerId, maxSlippage.deprovision);
-      emit RetractedSlippageIncompatibleOffer(order.outbound_tkn, order.inbound_tkn, order.offerId);
-    }
-    data = super.__posthookFallback__(order, result);
+  ///@inheritdoc MangroveOffer
+  function __checkList__(IERC20 token) internal view virtual override {
+    require(address(_priceFeed[address(token)]) != address(0), "DirectOracle/price-feed-not-found");
+    super.__checkList__(token);
+  }
+
+  function __put__(uint amount, MgvLib.SingleOrder calldata order) internal virtual override returns (uint) {
+    IERC20(order.inbound_tkn).transfer(admin(), amount);
+    return super.__put__(amount, order);
   }
 }

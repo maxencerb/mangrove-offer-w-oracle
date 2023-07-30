@@ -3,6 +3,8 @@ mgv_lib/=node_modules/@mangrovedao/mangrove-core/lib/
 mgv_test/=node_modules/@mangrovedao/mangrove-core/test/
 mgv_script/=node_modules/@mangrovedao/mangrove-core/script/
 
+oracle_maker/=src/
+
 ds-test/=node_modules/@mangrovedao/mangrove-core/lib/forge-std/lib/ds-test/src/
 forge-std/=node_modules/@mangrovedao/mangrove-core/lib/forge-std/src/
 
